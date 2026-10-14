@@ -286,7 +286,9 @@ def get_paper_ecg(input_file,header_file,output_directory, seed, add_dc_pulse,ad
 
         outfile = os.path.join(output_directory,rec_tail+'.png')
 
-        json_object = json.dumps(json_dict, indent=4)
+        if '_image_augmentation' in configs:
+            json_dict['image_augmentation'] = configs['_image_augmentation']
+        json_object = json.dumps(json_dict, separators=(',', ':'))
 
         # Writing to sample.json
         if store_configs:

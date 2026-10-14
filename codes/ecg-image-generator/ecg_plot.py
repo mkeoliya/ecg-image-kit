@@ -52,6 +52,44 @@ papersize_values = {'A0' : (33.1,46.8),
                     }
 
 
+SUPPORTS_INLINE_AUGMENTATION = True
+
+_figure_cache = {}
+
+
+def _cache_axis_raster(fig, ax):
+    # Axes' patch and axis artists precede waveforms; spines/text retain their
+    # original subsequent draw order. Never flatten an overlaid waveform.
+    original_x_draw, original_y_draw = ax.xaxis.draw, ax.yaxis.draw
+    state = {'key': None, 'background': None}
+    def draw_x(renderer):
+        key = getattr(ax, '_ecg_grid_key', None)
+        state['reuse'] = key is not None and state['key'] == key and state['background'] is not None
+        if state['reuse']:
+            fig.canvas.restore_region(state['background'])
+        else:
+            original_x_draw(renderer)
+    def draw_y(renderer):
+        if not state.get('reuse', False):
+            original_y_draw(renderer)
+            state['background'] = fig.canvas.copy_from_bbox(fig.bbox)
+            state['key'] = getattr(ax, '_ecg_grid_key', None)
+    ax.xaxis.draw, ax.yaxis.draw = draw_x, draw_y
+
+
+def _reusable_axes(width, height, resolution, show_grid):
+    key = (width, height, resolution, bool(show_grid))
+    if key not in _figure_cache:
+        if len(_figure_cache) >= 4:
+            _figure_cache.pop(next(iter(_figure_cache)))
+        _figure_cache[key] = plt.subplots(figsize=(width, height), dpi=resolution)
+        _cache_axis_raster(*_figure_cache[key])
+    fig, ax = _figure_cache[key]
+    for artist in list(ax.lines) + list(ax.texts):
+        artist.remove()
+    ax.dataLim.set_points(np.array([[np.inf, np.inf], [-np.inf, -np.inf]]))
+    return fig, ax
+
 def inches_to_dots(value,resolution):
     return (value * resolution)
 
@@ -163,7 +201,7 @@ def ecg_plot(
     json_dict['width'] = int(width*resolution)
     json_dict['height'] = int(height*resolution)
     #Set figure and subplot sizes
-    fig, ax = plt.subplots(figsize=(width, height), dpi=resolution)
+    fig, ax = _reusable_axes(width, height, resolution, show_grid)
    
     fig.subplots_adjust(
         hspace = 0, 
@@ -209,8 +247,10 @@ def ecg_plot(
     
     ax.set_ylim(y_min,y_max)
     ax.set_xlim(x_min,x_max)
-    ax.tick_params(axis='x', colors='white')
-    ax.tick_params(axis='y', colors='white')
+    if not getattr(ax, '_ecg_white_ticks', False):
+        ax.tick_params(axis='x', colors='white')
+        ax.tick_params(axis='y', colors='white')
+        ax._ecg_white_ticks = True
     
     #Step size will be number of seconds per sample i.e 1/sampling_rate
     step = (1.0/sample_rate)
@@ -353,11 +393,11 @@ def ecg_plot(
         current_lead_ds["start_sample"] = st
         current_lead_ds["end_sample"]= st + len(ecg[leadName])
         current_lead_ds["plotted_pixels"] = []
-        for j in range(len(x_vals)):
-            xi, yi = x_vals[j], y_vals[j]
-            xi, yi = ax.transData.transform((xi, yi))
-            yi = json_dict['height'] - yi
-            current_lead_ds['plotted_pixels'].append([round(yi, 2), round(xi, 2)])
+        pixels = ax.transData.transform(np.column_stack((x_vals, y_vals)))
+        # Upstream transforms return float64; numpy.float64.__round__ uses
+        # the same NumPy rounding semantics, now evaluated as one array.
+        pixels[:, 1] = json_dict['height'] - pixels[:, 1]
+        current_lead_ds['plotted_pixels'] = np.round(pixels[:, ::-1], 2).tolist()
 
         leads_ds.append(current_lead_ds)
 
@@ -447,11 +487,11 @@ def ecg_plot(
         current_lead_ds["start_sample"] = start_index
         current_lead_ds["end_sample"] = start_index + len(ecg['full'+full_mode])
         current_lead_ds['plotted_pixels'] = []
-        for i in range(len(x_vals)):
-            xi, yi = x_vals[i], y_vals[i]
-            xi, yi = ax.transData.transform((xi, yi))
-            yi = json_dict['height'] - yi
-            current_lead_ds['plotted_pixels'].append([round(yi, 2), round(xi, 2)])
+        pixels = ax.transData.transform(np.column_stack((x_vals, y_vals)))
+        # Upstream transforms return float64; numpy.float64.__round__ uses
+        # the same NumPy rounding semantics, now evaluated as one array.
+        pixels[:, 1] = json_dict['height'] - pixels[:, 1]
+        current_lead_ds['plotted_pixels'] = np.round(pixels[:, ::-1], 2).tolist()
         leads_ds.append(current_lead_ds)
 
 
@@ -486,29 +526,36 @@ def ecg_plot(
     ax.text(2, 0.5, '25mm/s', fontsize=lead_fontsize)
     ax.text(4, 0.5, '10mm/mV', fontsize=lead_fontsize)
     
-    if(show_grid):
-        ax.set_xticks(np.arange(x_min,x_max,x_grid_size))    
-        ax.set_yticks(np.arange(y_min,y_max,y_grid_size))
-        ax.minorticks_on()
-        
-        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    grid_style = (bool(show_grid), tuple(color_major), tuple(color_minor),
+                  x_min, x_max, y_min, y_max, grid_line_width, x_grid_size, y_grid_size)
+    if getattr(ax, '_ecg_grid_style', None) != grid_style:
+        if show_grid:
+            ax.set_xticks(np.arange(x_min,x_max,x_grid_size))
+            ax.set_yticks(np.arange(y_min,y_max,y_grid_size))
+            ax.minorticks_on()
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.grid(which='major', linestyle='-', linewidth=grid_line_width, color=color_major)
+            ax.grid(which='minor', linestyle='-', linewidth=grid_line_width, color=color_minor)
+        else:
+            ax.grid(False)
+        ax._ecg_grid_style = grid_style
+    if show_grid and store_configs == 2:
+        json_dict['grid_line_color_major'] = [round(x*255., 2) for x in color_major]
+        json_dict['grid_line_color_minor'] = [round(x*255., 2) for x in color_minor]
+        json_dict['ecg_plot_color'] = [round(x*255., 2) for x in color_line]
 
-        #set grid line style
-        ax.grid(which='major', linestyle='-', linewidth=grid_line_width, color=color_major)
-        
-        ax.grid(which='minor', linestyle='-', linewidth=grid_line_width, color=color_minor)
-        
-        if store_configs == 2:
-            json_dict['grid_line_color_major'] = [round(x*255., 2) for x in color_major]
-            json_dict['grid_line_color_minor'] = [round(x*255., 2) for x in color_minor]
-            json_dict['ecg_plot_color'] = [round(x*255., 2) for x in color_line]
+    ax._ecg_grid_key = (width, height, resolution, bool(show_grid), tuple(color_major),
+                        tuple(color_minor), tuple(ax.get_xlim()), tuple(ax.get_ylim()),
+                        tuple(fig.get_facecolor()), tuple(ax.get_facecolor()))
+    callback = configs.get('_save_augmented_image')
+    if callback is None:
+        fig.savefig(os.path.join(output_dir,tail +'.png'),dpi=resolution,
+                    pil_kwargs={'compress_level': configs.get('png_compress_level', 6),
+                                'compress_type': configs.get('png_compress_type', -1)})
     else:
-        ax.grid(False)
-
-    plt.savefig(os.path.join(output_dir,tail +'.png'),dpi=resolution)
+        fig.canvas.draw()
+        callback(np.asarray(fig.canvas.buffer_rgba()), os.path.join(output_dir,tail +'.png'))
     plt.close(fig)
-    plt.clf()
-    plt.cla()
 
     if pad_inches!=0:
         
